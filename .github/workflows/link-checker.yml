@@ -1,0 +1,234 @@
+name: Check Markdown Links
+
+on:
+  schedule:
+    - cron: '38 10 * * 1' # Mondays at 10:38 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  DEFAULT_ISSUE_NUMBER: '240'
+
+jobs:
+  linkChecker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Link Checker
+        id: lychee
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # ratchet:lycheeverse/lychee-action@v2
+        with:
+          args: --config ./lychee.toml './skills/**/*.md' './plugins/**/*.md' './*.md'
+          fail: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare Issue Body and Auto-Triage Broken Links
+        if: steps.lychee.outputs.exit_code != 0
+        run: |
+          cat << 'EOF' > ./lychee/issue-body.md
+          > **Note:** All broken links need to be updated in the internal source of truth.
+
+          EOF
+          cat ./lychee/out.md >> ./lychee/issue-body.md
+
+          # Auto-triage .md.txt and HTML 404 failures and markdown syntax errors
+          python3 - << 'PYEOF' >> ./lychee/issue-body.md
+          import pathlib
+          import re
+          import subprocess
+          import urllib.parse
+
+          out_path = pathlib.Path("./lychee/out.md")
+          if not out_path.exists():
+              raise SystemExit(0)
+
+          text = out_path.read_text(encoding="utf-8")
+          urls_404 = sorted(set(re.findall(r"\* \[404\] <(https?://[^>]+)>", text)))
+          urls_error = sorted(set(re.findall(r"\* \[ERROR\] <(https?://[^>]+)>", text)))
+          other_fail_lines = [
+              line.strip()
+              for line in text.splitlines()
+              if re.match(r"^\* \[(?!404\]|ERROR\])[^\]]+\]", line.strip())
+          ]
+          syntax_lines = [
+              line.strip()
+              for line in text.splitlines()
+              if "unclosed" in line.lower() or "invalid url" in line.lower()
+          ]
+
+          def probe_url(target_url: str) -> tuple[str, str]:
+              res = subprocess.run(
+                  [
+                      "curl", "--http1.1", "-Ls", "-o", "/dev/null",
+                      "-w", "%{http_code} %{url_effective}",
+                      "--max-time", "10", target_url,
+                  ],
+                  capture_output=True, text=True, check=False,
+              )
+              parts = res.stdout.strip().split(" ", 1)
+              code = parts[0] if parts else ""
+              effective = parts[1].rstrip("/") if len(parts) > 1 else ""
+              return code, effective
+
+          def format_fix(canonical_html: str) -> str:
+              md_candidate = f"{canonical_html.rstrip('/')}.md.txt"
+              md_code, _ = probe_url(md_candidate)
+              if md_code == "200":
+                  return f"Update to `{md_candidate}` (or HTML `{canonical_html}`, HTTP 200)"
+              return f"Update to `{canonical_html}` (HTTP 200, no `.md.txt` endpoint)"
+
+          def resolve_devsite_html_404(url: str) -> str:
+              parsed = urllib.parse.urlparse(url)
+              if parsed.netloc not in ("cloud.google.com", "docs.cloud.google.com"):
+                  return ""
+              segments = [s for s in parsed.path.strip("/").split("/") if s]
+              base = "https://docs.cloud.google.com"
+
+              # 1. Try dropping a single intermediate segment (e.g. /reference/migration/ -> /migration/)
+              for i in range(1, len(segments) - 1):
+                  cand_path = "/" + "/".join(segments[:i] + segments[i + 1:])
+                  code, eff = probe_url(base + cand_path)
+                  if code == "200" and eff:
+                      return eff
+
+              # 2. Try joining the last two segments with '.' (e.g. REST resources /projects.traces/spans)
+              if len(segments) >= 2:
+                  cand_path = "/" + "/".join(segments[:-2] + [f"{segments[-2]}.{segments[-1]}"])
+                  code, eff = probe_url(base + cand_path)
+                  if code == "200" and eff:
+                      return eff
+
+              # 3. Walk up to nearest valid DevSite ancestor or reference nav page and search child links
+              nav_roots = []
+              for cut in range(len(segments) - 1, 0, -1):
+                  nav_roots.append(base + "/" + "/".join(segments[:cut]))
+              if len(segments) >= 2 and segments[1] == "docs":
+                  nav_roots.insert(0, f"{base}/{segments[0]}/docs/reference/libraries")
+
+              target_prefix = "/" + "/".join(segments) + "/"
+              for nav_url in nav_roots:
+                  res = subprocess.run(
+                      ["curl", "-Ls", "--max-time", "10", nav_url],
+                      capture_output=True, text=True, check=False,
+                  )
+                  if not res.stdout:
+                      continue
+                  hrefs = sorted(set(re.findall(r'href="(/[^"#?]+)"', res.stdout)))
+                  child_matches = [h for h in hrefs if h.startswith(target_prefix)]
+                  if child_matches:
+                      overview = [h for h in child_matches if "overview" in h]
+                      chosen = overview[0] if overview else child_matches[0]
+                      code, eff = probe_url(base + chosen)
+                      if code == "200" and eff:
+                          return eff
+              return ""
+
+          rows = []
+          for url in urls_404:
+              try:
+                  if url.endswith(".md.txt"):
+                      bare_url = url[:-len(".md.txt")]
+                      bare_code, effective = probe_url(bare_url)
+                      if bare_code == "200" and effective and effective != bare_url.rstrip("/"):
+                          candidate_md = f"{effective}.md.txt"
+                          md_code, _ = probe_url(candidate_md)
+                          if md_code == "200":
+                              rows.append((
+                                  f"`{url}`",
+                                  "`.md.txt` Redirect 404",
+                                  f"Update to `{candidate_md}` (HTTP 200)",
+                              ))
+                          else:
+                              rows.append((
+                                  f"`{url}`",
+                                  "Non-DevSite Redirect Target",
+                                  f"Update to `{effective}` (HTTP 200, no `.md.txt` endpoint)",
+                              ))
+                      else:
+                          resolved_html = resolve_devsite_html_404(bare_url)
+                          if resolved_html:
+                              rows.append((
+                                  f"`{url}`",
+                                  "`.md.txt` 404 (Moved DevSite Path)",
+                                  format_fix(resolved_html),
+                              ))
+                          else:
+                              rows.append((
+                                  f"`{url}`",
+                                  "`.md.txt` 404 Not Found",
+                                  "Verify canonical documentation URL in source skill",
+                              ))
+                  else:
+                      resolved_html = resolve_devsite_html_404(url)
+                      if resolved_html:
+                          rows.append((
+                              f"`{url}`",
+                              "HTML 404 (Moved DevSite Path)",
+                              format_fix(resolved_html),
+                          ))
+                      else:
+                          rows.append((
+                              f"`{url}`",
+                              "HTML 404 Not Found",
+                              "Replace broken HTML URL (prefer `.md.txt` if on DevSite)",
+                          ))
+              except Exception:
+                  pass
+
+          real_error_count = 0
+          for url in urls_error:
+              code, _ = probe_url(url)
+              if code in ("200", "302", "429"):
+                  rows.append((
+                      f"`{url}`",
+                      f"Transient HTTP/2 Error (HTTP {code})",
+                      "No action needed (verified live over HTTP/1.1)",
+                  ))
+              else:
+                  real_error_count += 1
+                  rows.append((
+                      f"`{url}`",
+                      f"Network / Connection Error (HTTP {code or 'ERR'})",
+                      "Verify target URL availability in source skill",
+                  ))
+
+          for line in syntax_lines:
+              rows.append((
+                  line,
+                  "Markdown Link Syntax Error",
+                  "Check file line for missing closing `)` or `]`",
+              ))
+
+          if not urls_404 and not syntax_lines and not other_fail_lines and real_error_count == 0 and urls_error:
+              pathlib.Path("./lychee/all_transient_ok").write_text("true\n", encoding="utf-8")
+
+          if rows:
+              print("\n### Automated Triage & Suggested Fixes\n")
+              print("| Broken Link / Entry | Root Cause | Recommended Fix |")
+              print("| :--- | :--- | :--- |")
+              for broken, cause, fix in rows:
+                  print(f"| {broken} | {cause} | {fix} |")
+          PYEOF
+
+      - name: Update or Close Living Link Checker Issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LYCHEE_EXIT_CODE: ${{ steps.lychee.outputs.exit_code }}
+          ISSUE_NUMBER: ${{ vars.LINK_CHECKER_ISSUE_NUMBER || env.DEFAULT_ISSUE_NUMBER }}
+        run: |
+          if [ "${LYCHEE_EXIT_CODE}" != "0" ] && [ ! -f ./lychee/all_transient_ok ]; then
+            gh issue edit "${ISSUE_NUMBER}" --body-file ./lychee/issue-body.md
+            gh issue reopen "${ISSUE_NUMBER}" 2>/dev/null || true
+          else
+            gh issue close "${ISSUE_NUMBER}" \
+              --comment "All Markdown links passed validation in the latest weekly Lychee run. Closing issue automatically." 2>/dev/null || true
+          fi
